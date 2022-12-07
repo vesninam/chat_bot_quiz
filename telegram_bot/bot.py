@@ -23,6 +23,9 @@ class QuizQuestion:
         self.correct_answer_position = correct_answer_position
         self.correct_answer = answers[correct_answer_position]
         self.db_id = db_id
+        self.poll_id = None
+        self.answer = ""
+        
         
 class APIClient:
     
@@ -60,23 +63,21 @@ class APIClient:
             raise ValueError(f"Unknown response from server: {resp.content}")
         return []
     
-    def submit_user_response(chat_id: str, question_id: int, answer: str):
+    def submit_user_response(chat_id: str, question: QuizQuestion):
         url = f"{BotConfig.API_URL}:{BotConfig.API_PORT}/users_by_tid/{int(chat_id)}"
         resp = requests.get(url)
-        print(url, resp)
         if resp.status_code == 200:
             _id = resp.json()["id"]
         else:
             logging.info(f"No User with telegram ID {chat_id}")
             return 
-        _json = {"question_id": int(question_id),
+        _json = {"question_id": int(question.db_id),
                  "user_id": _id,
                  "response_time": "2022-12-07T08:19:54.375Z",
-                 "answer": answer
+                 "answer": question.answer
                 }
         url = f"{BotConfig.API_URL}:{BotConfig.API_PORT}/user_responses/"
         resp = requests.post(url, json=_json) 
-        print(url, resp, _json)
         
     
     @staticmethod
@@ -127,6 +128,32 @@ def is_answer_correct(poll):
             break
     return ret
 
+def is_quiz_done(chat_id):
+    done = [1 for q in user_quizes[chat_id]["questions"] if not q.poll_id is None]
+    return len(user_quizes[chat_id]["questions"]) == len(done)
+
+def get_next_question(chat_id):
+    retq = None
+    for q in user_quizes[chat_id]["questions"]:
+        if q.poll_id is None:
+            retq = q
+            break
+    return retq
+
+def get_question_index(update, chat_id):
+    i = None 
+    retq = None
+    if not chat_id in user_quizes:
+        return (None, None)
+    for ii, q in  enumerate(user_quizes[chat_id]["questions"]):
+        u_poll_id = update.poll.id
+        if q.poll_id == u_poll_id:
+            i = ii
+            retq = q
+            break
+    return i, retq
+
+
 def send_text_message(update, context, message):
     chat_id, _ = get_chat_id_user(update, context)
     context.bot.send_message(chat_id=chat_id, text=message)
@@ -145,6 +172,7 @@ def send_quiz_question(update, context, quiz_question):
         explanation_parse_mode=telegram.ParseMode.MARKDOWN_V2,
     )
     issued_polls[chat_id]["questions"] = [message.poll.id, "issued"]
+    quiz_question.poll_id = message.poll.id
     user_busy[chat_id] = True
     # Save some info about the poll the bot_data for later use in receive_quiz_answer
     context.bot_data.update({message.poll.id: message.chat.id})
@@ -168,16 +196,18 @@ def poll_response_handler(update, context):
     logging.info(f"option #3 : {update.poll.options[2]}")
     logging.info(f"option #4 : {update.poll.options[3]}")
     user_answer = get_answer(update.poll)
-    if chat_id in user_quizes and user_quizes[chat_id]["answers"]:
-        i = user_quizes[chat_id]["position"] - 1
-        user_quizes[chat_id]["answers"][i] = user_answer
+    if chat_id in user_quizes and user_quizes[chat_id]["questions"]:
+        i, q = get_question_index(update, chat_id)
+        if i is None:
+            logging.error(f"Could not find correct question for poll {update.poll.id}")
+            return 
+        q.answer = user_answer
     correct_answer = update.poll.options[update.poll.correct_option_id]['text']
 
     polls_answers[update.poll.id] = {"user": user_answer, "correct": correct_answer}
     logging.info(f"correct option {is_answer_correct(update.poll)}")
     _text = BotConfig.MESSAGES["answer"][BotConfig.LANG] + f"{correct_answer}"
     send_text_message(update, context, _text)
-
     user_busy[chat_id] = False
     logging.info(f"Poll response porcessed for {chat_id}")
     if chat_id in user_idle and user_idle[chat_id] is False:
@@ -194,18 +224,12 @@ def start_poll(update, context):
     user_idle[chat_id] = False
     if not chat_id in user_quizes:
         user_quizes[chat_id]["questions"] = []
-        user_quizes[chat_id]["answers"] = []
-        user_quizes[chat_id]["position"] = 0
-    if (user_quizes[chat_id]["questions"] and 
-        len(user_quizes[chat_id]["questions"]) <= user_quizes[chat_id]["position"]):
+    if (user_quizes[chat_id]["questions"] and is_quiz_done(chat_id)):
         user_busy[chat_id] = False
         user_idle[chat_id] = True
         for i ,q in enumerate(user_quizes[chat_id]["questions"]):
-            answer = user_quizes[chat_id]["answers"][i]
-            APIClient.submit_user_response(chat_id, q[-1], answer)
+            APIClient.submit_user_response(chat_id, q)
         user_quizes[chat_id]["questions"] = []
-        user_quizes[chat_id]["position"] = 0
-        user_quizes[chat_id]["answers"] = []
     else:
         if not user_quizes[chat_id]["questions"]:
 
@@ -224,16 +248,13 @@ def start_poll(update, context):
                 del user_quizes[chat_id]
                 send_text_message(update, context, 
                                   BotConfig.MESSAGES["start"][BotConfig.LANG])
-            user_quizes[chat_id]["questions"] = polls
-            user_quizes[chat_id]["position"] = 0
-            user_quizes[chat_id]["answers"] = ["" for _ in polls]
+            user_quizes[chat_id]["questions"] = [QuizQuestion(*q) for q in polls]
             logging.info(f"Starting polls {len(polls)} questions")
         user_busy[chat_id] = True
         user_idle[chat_id] = False
-        question = user_quizes[chat_id]["questions"][user_quizes[chat_id]["position"]]
-        quiz_question = QuizQuestion(*question)
-        user_quizes[chat_id]["position"] += 1
-        send_quiz_question(update, context, quiz_question)
+        question = get_next_question(chat_id)
+        if not question is None:
+            send_quiz_question(update, context, question)
 
 
 def start_command_handler(update, context):
